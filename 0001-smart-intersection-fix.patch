@@ -1,0 +1,1855 @@
+From d3f1ff606854af3c10ddcda54ece6fc1aa614e22 Mon Sep 17 00:00:00 2001
+From: Collins Lu <collins_lu@sertek.com.tw>
+Date: Thu, 8 Oct 2026 11:08:54 +0800
+Subject: [PATCH] smart-intersection: start dlstreamer pipelines sequentially,
+ fix node-red build
+
+dlstreamer-pipeline-server's built-in auto_start launches all 4 camera
+pipelines concurrently right as it finishes booting, which reliably
+crashes every one of them (the gvapython datapublisher callback races
+to open an MQTT connection at the same instant). Disable auto_start in
+config.json and add a one-shot dlstreamer-pipeline-starter container
+that starts them sequentially over the REST API instead, surviving
+restarts/reboots.
+
+Also switch node-red to build from a local Dockerfile that installs
+node-red-contrib-influxdb at image build time, instead of installing
+it at container startup via install_package.sh.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ .../compose-scenescape.yml                    |   29 +-
+ .../dlstreamer-pipeline-server/config.json    | 1640 ++++++++---------
+ .../start_pipelines.py                        |   76 +
+ .../src/node-red/Dockerfile                   |    4 +
+ 4 files changed, 926 insertions(+), 823 deletions(-)
+ create mode 100644 metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/start_pipelines.py
+ create mode 100644 metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/node-red/Dockerfile
+
+diff --git a/metro-ai-suite/metro-vision-ai-app-recipe/compose-scenescape.yml b/metro-ai-suite/metro-vision-ai-app-recipe/compose-scenescape.yml
+index 4f2e9174..b710569b 100644
+--- a/metro-ai-suite/metro-vision-ai-app-recipe/compose-scenescape.yml
++++ b/metro-ai-suite/metro-vision-ai-app-recipe/compose-scenescape.yml
+@@ -44,7 +44,9 @@ services:
+     restart: on-failure:5
+ 
+   node-red:
+-    image: docker.io/nodered/node-red:4.1
++    build:
++      context: ./${SAMPLE_APP}/src/node-red
++      dockerfile: Dockerfile
+     user: root
+     environment:
+       TZ: America/Los_Angeles
+@@ -60,7 +62,6 @@ services:
+       - ./${SAMPLE_APP}/src/node-red/flows.json:/data/flows.json
+       - ./${SAMPLE_APP}/src/node-red/flows_cred.json:/tmp/flows_cred.json
+       - ./${SAMPLE_APP}/src/node-red/settings.js:/data/settings.js
+-      - ./${SAMPLE_APP}/src/node-red/install_package.sh:/data/install_package.sh
+       - node-red-node-modules:/usr/src/node-red/node_modules
+     secrets:
+       - influxdb2-admin-token
+@@ -78,7 +79,6 @@ services:
+         "-c",
+         "cp /tmp/flows_cred.json /data/flows_cred.json && \
+         sed -i \"s/<influx-api-token>/$(cat /run/secrets/influxdb2-admin-token)/g\" /data/flows_cred.json && \
+-        bash /data/install_package.sh && \
+         /usr/src/node-red/entrypoint.sh",
+       ]
+     restart: on-failure:5
+@@ -213,6 +213,29 @@ services:
+         target: certs/scenescape-ca.pem
+     restart: on-failure:5
+ 
++  # dlstreamer-pipeline-server's built-in auto_start launches all enabled
++  # pipelines concurrently the instant it finishes booting, which races and
++  # reliably leaves every pipeline in an ERROR state. All pipelines in
++  # config.json have auto_start set to false; this one-shot container starts
++  # them sequentially over the REST API instead, so the fix survives
++  # restarts/reboots instead of relying on a manual REST call each time.
++  dlstreamer-pipeline-starter:
++    image: python:3.12
++    networks:
++      - scenescape
++    depends_on:
++      - dlstreamer-pipeline-server
++    environment:
++      - PIPELINE_SERVER_HOST=dlstreamer-pipeline-server
++      - PIPELINE_SERVER_PORT=8080
++      - AUTOSTART_PIPELINES=intersection-cam3,intersection-cam4,intersection-cam1-gpu,intersection-cam2-gpu
++      - AUTOSTART_STAGGER_SECONDS=5
++    volumes:
++      - ./${SAMPLE_APP}/src/dlstreamer-pipeline-server/config.json:/home/pipeline-server/config.json:ro
++      - ./${SAMPLE_APP}/src/dlstreamer-pipeline-server/start_pipelines.py:/start_pipelines.py:ro
++    entrypoint: ["python3", "/start_pipelines.py"]
++    restart: "no"
++
+   pgserver:
+     image: postgres:17.6
+     env_file:
+diff --git a/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/config.json b/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/config.json
+index 77cf7fa4..2097871a 100644
+--- a/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/config.json
++++ b/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/config.json
+@@ -1,846 +1,846 @@
+ {
+-    "config": {
+-        "pipelines": [
+-            {
+-                "name": "intersection-cam1",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": true,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122north_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera1"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera1",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++  "config": {
++    "pipelines": [
++      {
++        "name": "intersection-cam1",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122north_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
+                 }
++              }
+             },
+-            {
+-                "name": "intersection-cam2",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": true,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122east_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera2"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera2",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
++                }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera1"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera1",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam2",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122east_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
++                }
++              }
++            },
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
++                }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera2"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera2",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam3",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122south_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
++                }
++              }
++            },
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
++                }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera3"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera3",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam4",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122west_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
++                }
++              }
++            },
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
++                }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera4"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera4",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam1-gpu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122north_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
++                }
++              }
++            },
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
++                }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera1"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera1",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam2-gpu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122east_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
+                 }
++              }
+             },
+-            {
+-                "name": "intersection-cam3",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": true,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122south_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera3"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera3",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
++                }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera2"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera2",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam3-gpu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122south_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
++                }
++              }
++            },
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
++                }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera3"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera3",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam4-gpu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122west_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
+                 }
++              }
+             },
+-            {
+-                "name": "intersection-cam4",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": true,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122west_h264.ts name=source ! decodebin3 ! videorate ! videoconvert ! video/x-raw,format=BGR,framerate=15/1 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect model-instance-id=detect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue ! gvametaconvert add-tensor-data=true name=metaconvert ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera4"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera4",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
+                 }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera4"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
+             },
+-            {
+-                "name": "intersection-cam1-gpu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122north_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera1"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera1",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "cameraid": "camera4",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam1-npu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122north_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
+                 }
++              }
+             },
+-            {
+-                "name": "intersection-cam2-gpu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122east_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera2"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera2",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
+                 }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera1"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
+             },
+-            {
+-                "name": "intersection-cam3-gpu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122south_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera3"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera3",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "cameraid": "camera1",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam2-npu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122east_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
+                 }
++              }
+             },
+-            {
+-                "name": "intersection-cam4-gpu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122west_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=GPU model-instance-id=gpudetect1 inference-interval=1 batch-size=1 nireq=1 ie-config=\"GPU_THROUGHPUT_STREAMS=1\" model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera4"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera4",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
+                 }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera2"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
+             },
+-            {
+-                "name": "intersection-cam1-npu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122north_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera1"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera1",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "cameraid": "camera2",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam3-npu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122south_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
+                 }
++              }
+             },
+-            {
+-                "name": "intersection-cam2-npu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122east_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera2"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera2",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
+                 }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera3"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
+             },
+-            {
+-                "name": "intersection-cam3-npu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122south_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera3"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera3",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "cameraid": "camera3",
++              "metadatagenpolicy": "detectionPolicy"
++            }
++          }
++        }
++      },
++      {
++        "name": "intersection-cam4-npu",
++        "source": "gstreamer",
++        "queue_maxsize": 50,
++        "auto_start": false,
++        "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122west_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
++        "parameters": {
++          "type": "object",
++          "properties": {
++            "ntp_config": {
++              "element": {
++                "name": "timesync",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "ntpServer": {
++                  "type": "string"
+                 }
++              }
+             },
+-            {
+-                "name": "intersection-cam4-npu",
+-                "source": "gstreamer",
+-                "queue_maxsize": 50,
+-                "auto_start": false,
+-                "pipeline": "multifilesrc loop=true location=/home/pipeline-server/videos/1122west_h264.ts name=source ! parsebin ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory) ! gvafpsthrottle target-fps=30 ! gvapython class=PostDecodeTimestampCapture function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=timesync ! gvadetect device=NPU batch-size=1 nireq=4 model-instance-id=npudetect1 inference-interval=1 model=/home/pipeline-server/models/object_detection/intersection/openvino.xml ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! gvametaconvert add-tensor-data=true name=metaconvert ! vapostproc ! video/x-raw,format=BGRA ! videoconvert ! video/x-raw,format=BGR ! gvapython class=PostInferenceDataPublish function=processFrame module=/home/pipeline-server/user_scripts/gvapython/sscape/sscape_adapter.py name=datapublisher ! gvametapublish name=destination ! appsink sync=true",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "ntp_config": {
+-                            "element": {
+-                                "name": "timesync",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "ntpServer": {
+-                                    "type": "string"
+-                                }
+-                            }
+-                        },
+-                        "camera_config": {
+-                            "element": {
+-                                "name": "datapublisher",
+-                                "property": "kwarg",
+-                                "format": "json"
+-                            },
+-                            "type": "object",
+-                            "properties": {
+-                                "intrinsics": {
+-                                    "type": "array",
+-                                    "items": {
+-                                        "type": "number",
+-                                        "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
+-                                    }
+-                                },
+-                                "cameraid": {
+-                                    "type": "string"
+-                                },
+-                                "metadatagenpolicy" : {
+-                                    "type": "string",
+-                                    "description" : "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
+-                                },
+-                                "publish_frame": {
+-                                    "type": "boolean",
+-                                    "description": "Publish frame to mqtt"
+-                                }
+-                            }
+-                        }
+-                    }
+-                },
+-                "payload": {
+-                    "destination":{
+-                        "frame": {
+-                            "type": "rtsp",
+-                            "path": "camera4"
+-                        }
+-                    },
+-                    "parameters": {
+-                        "ntp_config": {
+-                            "ntpServer": "ntpserv"
+-                        },
+-                        "camera_config": {
+-                            "cameraid": "camera4",
+-                            "metadatagenpolicy": "detectionPolicy"
+-                        }
+-                    }
++            "camera_config": {
++              "element": {
++                "name": "datapublisher",
++                "property": "kwarg",
++                "format": "json"
++              },
++              "type": "object",
++              "properties": {
++                "intrinsics": {
++                  "type": "array",
++                  "items": {
++                    "type": "number",
++                    "description": "Camera intrinsics as [diagonal_fov] or [horizontal_fov, vertical_fov] or [fx,fy,cx,cy] "
++                  }
++                },
++                "cameraid": {
++                  "type": "string"
++                },
++                "metadatagenpolicy": {
++                  "type": "string",
++                  "description": "Meta data generation policy, one of detectionPolicy(default),reidPolicy,classificationPolicy"
++                },
++                "publish_frame": {
++                  "type": "boolean",
++                  "description": "Publish frame to mqtt"
+                 }
++              }
++            }
++          }
++        },
++        "payload": {
++          "destination": {
++            "frame": {
++              "type": "rtsp",
++              "path": "camera4"
++            }
++          },
++          "parameters": {
++            "ntp_config": {
++              "ntpServer": "ntpserv"
++            },
++            "camera_config": {
++              "cameraid": "camera4",
++              "metadatagenpolicy": "detectionPolicy"
+             }
+-        ]
+-    }
++          }
++        }
++      }
++    ]
++  }
+ }
+diff --git a/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/start_pipelines.py b/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/start_pipelines.py
+new file mode 100644
+index 00000000..14392c6b
+--- /dev/null
++++ b/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/dlstreamer-pipeline-server/start_pipelines.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++# Starts the pipelines listed in AUTOSTART_PIPELINES one at a time, waiting
++# AUTOSTART_STAGGER_SECONDS between each. dlstreamer-pipeline-server's own
++# built-in auto_start launches all enabled pipelines concurrently right as it
++# finishes its slow model-loading boot, which reliably crashes every one of
++# them (the gvapython "datapublisher" callback races to open an MQTT
++# connection at the same instant and fails for all of them). Starting them
++# sequentially from outside avoids that race.
++import json
++import os
++import time
++import urllib.error
++import urllib.request
++
++HOST = os.environ.get("PIPELINE_SERVER_HOST", "dlstreamer-pipeline-server")
++PORT = os.environ.get("PIPELINE_SERVER_PORT", "8080")
++GROUP = "user_defined_pipelines"
++CONFIG_PATH = os.environ.get("PIPELINE_CONFIG_PATH", "/home/pipeline-server/config.json")
++STAGGER_SECONDS = float(os.environ.get("AUTOSTART_STAGGER_SECONDS", "5"))
++READY_TIMEOUT_SECONDS = float(os.environ.get("AUTOSTART_READY_TIMEOUT_SECONDS", "1800"))
++PIPELINE_NAMES = [n.strip() for n in os.environ.get("AUTOSTART_PIPELINES", "").split(",") if n.strip()]
++
++
++def wait_until_ready():
++    url = f"http://{HOST}:{PORT}/pipelines/status"
++    deadline = time.time() + READY_TIMEOUT_SECONDS
++    while time.time() < deadline:
++        try:
++            with urllib.request.urlopen(url, timeout=5) as resp:
++                if resp.status == 200:
++                    return
++        except (urllib.error.URLError, ConnectionError, TimeoutError):
++            pass
++        time.sleep(5)
++    raise TimeoutError(f"{url} did not become ready within {READY_TIMEOUT_SECONDS:.0f}s")
++
++
++def start_pipeline(version, payload):
++    url = f"http://{HOST}:{PORT}/pipelines/{GROUP}/{version}"
++    data = json.dumps(payload).encode()
++    req = urllib.request.Request(
++        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=10) as resp:
++            print(f"[{version}] started: HTTP {resp.status}", flush=True)
++    except urllib.error.HTTPError as e:
++        print(f"[{version}] failed to start: HTTP {e.code} {e.read().decode(errors='replace')}", flush=True)
++    except Exception as e:
++        print(f"[{version}] failed to start: {e}", flush=True)
++
++
++def main():
++    if not PIPELINE_NAMES:
++        print("AUTOSTART_PIPELINES is empty, nothing to start", flush=True)
++        return
++
++    print("Waiting for dlstreamer-pipeline-server REST API...", flush=True)
++    wait_until_ready()
++
++    with open(CONFIG_PATH) as f:
++        cfg = json.load(f)
++    pipelines_by_name = {p["name"]: p for p in cfg["config"]["pipelines"]}
++
++    for i, name in enumerate(PIPELINE_NAMES):
++        pipeline = pipelines_by_name.get(name)
++        if pipeline is None:
++            print(f"[{name}] not found in {CONFIG_PATH}, skipping", flush=True)
++            continue
++        start_pipeline(name, pipeline.get("payload", {}))
++        if i < len(PIPELINE_NAMES) - 1:
++            time.sleep(STAGGER_SECONDS)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/node-red/Dockerfile b/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/node-red/Dockerfile
+new file mode 100644
+index 00000000..076adf98
+--- /dev/null
++++ b/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/node-red/Dockerfile
+@@ -0,0 +1,4 @@
++FROM docker.io/nodered/node-red:4.1
++
++WORKDIR /usr/src/node-red
++RUN npm install node-red-contrib-influxdb
+-- 
+2.43.0
+
